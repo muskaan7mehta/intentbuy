@@ -15,25 +15,38 @@ const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 const STOREFRONT_TOKEN = process.env.SHOPIFY_STOREFRONT_TOKEN;
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
-// Validate required env vars at startup
 ['SHOPIFY_STORE_URL', 'SHOPIFY_ADMIN_TOKEN', 'SHOPIFY_STOREFRONT_TOKEN', 'OPENAI_API_KEY'].forEach(key => {
   if (!process.env[key]) console.error(`⚠️  Missing env var: ${key}`);
   else console.log(`✓ ${key} loaded (${process.env[key].slice(0, 8)}...)`);
 });
 
 // ── Session memory ───────────────────────────────────────────────
-// sessions[sessionId] = { history: [{role,content}], personProfile: {} }
+// sessions[sessionId] = { history, personProfile, recipientProfile, searchAttempts }
 const sessions = new Map();
 
 function getSession(sessionId) {
   if (!sessions.has(sessionId)) {
-    sessions.set(sessionId, { history: [], personProfile: {} });
+    sessions.set(sessionId, {
+      history: [],
+      personProfile: {},
+      recipientProfile: {
+        occasion: null,
+        relationship: null,
+        age: null,
+        gender: null,
+        lifestyle: null,
+        interests: [],
+        budget: null,
+        constraints: []
+      },
+      searchAttempts: 0
+    });
   }
   return sessions.get(sessionId);
 }
 
 // ── Shopify product fetchers ─────────────────────────────────────
-async function fetchProductsByTag(tag, limit = 20) {
+async function fetchProductsByTag(tag) {
   try {
     const res = await axios.get(
       `https://${SHOP}/admin/api/2024-01/products.json`,
@@ -97,77 +110,126 @@ function safeParseJSON(raw, fallback) {
   }
 }
 
-// ── Person-Centered Profile Builder ─────────────────────────────
-// Builds a rich profile from conversation, not just keywords
-async function buildPersonProfile(message, existingProfile, history) {
-  const system = `You are an empathetic shopping agent that understands the PERSON behind every request.
+// ── Layer 1: Intent to Search Query ─────────────────────────────
+// Converts raw user input into structured search parameters.
+// Also decides if a single clarifying question is needed.
+// Also updates gift recipient profile from conversation.
+async function analyzeIntent(message, session) {
+  const { personProfile, recipientProfile, history } = session;
 
-Given the user's message and any existing profile, produce an updated person profile.
+  const system = `You are an AI shopping agent. Analyze the user's message and convert it into structured search parameters.
 
-Think beyond keywords. "Gift for my tired dad who wants better health" reveals:
-- recipient: dad, age ~50s, lifestyle: likely sedentary/busy, goal: health improvement, emotional state: tired/stressed
+Current person profile: ${JSON.stringify(personProfile)}
+Current recipient profile: ${JSON.stringify(recipientProfile)}
 
-From the profile, decide what product CATEGORIES to search (can be multiple):
-Available tags in store: running, casual, formal, training, trail, fitness, wellness, yoga, gym, recovery
+Available product tags in store: running, casual, formal, training, trail, fitness, wellness, yoga, gym, recovery
 
-Rules:
-- For gifts: focus on recipient's profile, not buyer's
-- Budget means TOTAL budget across all picks
-- For open-ended or luxurious gifts with no specific category: set searchAll=true so the ranker can pick diverse options
-- If user says "home gym" → search fitness + training + gym
-- If user wants "wellness" → search wellness + recovery + fitness
-- If buying for "tired/stressed person" → recovery + wellness + casual
-- If "luxurious" or "birthday" with no category specified → searchAll=true
-- Do NOT assume shoes unless explicitly mentioned
+CLARIFYING QUESTION RULES — pick AT MOST ONE, then stop:
+1. Budget missing AND product category completely unclear → ask about budget range
+2. It is clearly a GIFT and recipient age/gender are unknown → ask age + gender in one question
+3. User mentioned running shoes AND foot type is unknown → ask foot type (flat/neutral/high arch)
+4. Enough info exists to search meaningfully → set clarifyQuestion to null, search immediately
+5. NEVER ask more than one question. If already asked once this session, do NOT ask again.
 
-Existing profile: ${JSON.stringify(existingProfile)}
+GIFT PROFILE: When isGift=true, extract all available info about the recipient from the message and set recipientProfileUpdate:
+{ occasion, relationship, age, gender, lifestyle (active/sedentary/busy), interests (array of strings), budget, constraints (array of strings) }
+Set fields to null if not mentioned. Only include fields that have new information.
 
-Respond ONLY with JSON:
+SEARCH PARAMS: Produce the best possible search parameters from what you know:
+- tags: subset of available tags above
+- budget: numeric INR value or null
+- useCase: brief description of what they need
+- searchAll: true for broad/open-ended or gift-with-no-category requests
+- category: primary category name
+
+MODE: SINGLE (one product for themselves), BUNDLE (kit/set), GIFT (buying for someone else)
+
+Respond ONLY with valid JSON:
 {
-  "personProfile": {
-    "isGift": false,
-    "recipient": null,
-    "recipientAge": null,
-    "recipientLifestyle": null,
-    "goal": null,
-    "occasion": null,
-    "budget": null,
-    "gait": null,
-    "constraints": [],
-    "emotionalContext": null
+  "searchParams": {
+    "tags": ["fitness", "wellness"],
+    "budget": 5000,
+    "useCase": "home workout for beginners",
+    "category": "fitness",
+    "searchAll": false
   },
-  "searchTags": ["running", "fitness"],
-  "searchAll": false,
+  "isGift": false,
   "mode": "SINGLE",
-  "missingInfo": null,
-  "clarifyQuestion": null
-}
-
-searchAll = true means search entire catalog.
-mode: SINGLE | BUNDLE | GIFT
-missingInfo: most important missing field or null
-clarifyQuestion: a natural follow-up question if needed, else null
-clarifyOptions: if clarifyQuestion is set, provide 5-7 short, tappable answer options that cover the likely responses. Example: for "What kind of wellness does your mom enjoy?" → ["Yoga & stretching", "Massage & recovery", "Walking & running", "Better sleep", "General fitness", "Not sure"]. Keep each option under 4 words if possible. Set to null if no clarifyQuestion.`;
+  "recipientProfileUpdate": null,
+  "personProfileUpdate": { "goal": "fitness" },
+  "clarifyQuestion": null,
+  "clarifyOptions": null
+}`;
 
   const raw = await callAI(system, message, history.slice(-6));
   return safeParseJSON(raw, {
-    personProfile: {},
-    searchTags: [],
-    searchAll: true,
+    searchParams: { tags: [], budget: null, useCase: '', category: '', searchAll: true },
+    isGift: false,
     mode: 'SINGLE',
-    missingInfo: null,
+    recipientProfileUpdate: null,
+    personProfileUpdate: {},
     clarifyQuestion: null,
     clarifyOptions: null
   });
 }
 
-// ── Product Ranker ───────────────────────────────────────────────
+// ── Layer 3: Quality Evaluation ──────────────────────────────────
+// Scores each product 0-100. Signals if re-search is needed.
+async function evaluateProducts(products, searchParams, session) {
+  if (products.length === 0) {
+    return { scores: [], needsResearch: false, alternativeTags: [] };
+  }
+
+  const { personProfile, recipientProfile } = session;
+  const profile = personProfile.isGift ? recipientProfile : personProfile;
+
+  const productList = products.slice(0, 30).map((p, i) => {
+    const tags = p.tags.split(',').map(t => t.trim()).join(', ');
+    const price = p.variants[0]?.price || '?';
+    const desc = p.body_html?.replace(/<[^>]*>/g, '').slice(0, 100) || '';
+    return `${i + 1}. ${p.title} | ₹${price} | Tags: ${tags} | ${desc}`;
+  }).join('\n');
+
+  const system = `You are a product quality evaluator for an AI shopping agent.
+
+User profile: ${JSON.stringify(profile)}
+Search use case: "${searchParams.useCase || 'general shopping'}"
+Budget: ${searchParams.budget ? `₹${searchParams.budget}` : 'not specified'}
+
+Score each product 0-100 on how well it matches the user's actual needs:
+- 90-100: Perfect match for their situation
+- 70-89: Good match, meets core needs
+- 50-69: Partial match, somewhat relevant
+- 30-49: Weak match, tangentially related
+- 0-29: Poor match
+
+If ALL top 3 scores are below 60, set needsResearch=true and list better alternativeTags to try next.
+Available tags to suggest: running, casual, formal, training, trail, fitness, wellness, yoga, gym, recovery
+
+Respond ONLY with valid JSON:
+{
+  "scores": [
+    { "productIndex": 1, "score": 85, "brief": "Good for home workouts" }
+  ],
+  "needsResearch": false,
+  "alternativeTags": []
+}`;
+
+  const raw = await callAI(system, productList);
+  return safeParseJSON(raw, {
+    scores: products.slice(0, 10).map((_, i) => ({ productIndex: i + 1, score: 55, brief: '' })),
+    needsResearch: false,
+    alternativeTags: []
+  });
+}
+
+// ── Layer 4: Final Recommendation ───────────────────────────────
+// Picks top 3 and generates reasoning + tradeoffs.
 async function rankProducts(products, personProfile, userMessage, usedFallback = false) {
   if (products.length === 0) return { picks: [], summary: "No products found.", followUpQuestion: null };
 
   const capped = products.slice(0, 40);
 
-  // Extract the primary category for each product so the AI can reason about diversity
   const KNOWN_CATS = ['running','casual','formal','training','trail','fitness','wellness','yoga','gym','recovery'];
   const productList = capped.map((p, i) => {
     const tags = p.tags.split(',').map(t => t.trim());
@@ -175,7 +237,6 @@ async function rankProducts(products, personProfile, userMessage, usedFallback =
     return `${i + 1}. [CAT:${primaryCat}] ${p.title} — ₹${p.variants[0]?.price || '?'} — ${p.body_html?.replace(/<[^>]*>/g, '').slice(0, 100)}`;
   }).join('\n');
 
-  // Check how many distinct categories are available
   const availableCats = [...new Set(capped.map(p => {
     const tags = p.tags.split(',').map(t => t.trim());
     return KNOWN_CATS.find(c => tags.includes(c)) || 'other';
@@ -208,22 +269,22 @@ ${fallbackNote}
 From the product list below, pick the TOP 3 best matches for this PERSON.
 Each pick must serve a different purpose or angle — not just be from a different brand.
 
-Return ONLY JSON (no markdown):
+Return ONLY valid JSON (no markdown):
 {
   "picks": [
     {
       "rank": 1,
       "productIndex": 3,
       "matchScore": 91,
-      "reason": "Perfect because... (1-2 sentences, be specific to their situation)",
+      "reason": "Perfect because... (1-2 sentences, specific to their situation)",
       "tradeoff": "Worth noting..."
     }
   ],
-  "summary": "Here's what I found — [2 sentences, mention the variety of options and why each serves a different need]",
+  "summary": "Here's what I found — [2 sentences mentioning the variety and why each serves a different need]",
   "followUpQuestion": null
 }
-productIndex is the 1-based number from the list.
-followUpQuestion: only if a specific question would meaningfully improve the picks, else null.`;
+productIndex is 1-based from the list.
+followUpQuestion: only if a specific question would meaningfully improve picks, else null.`;
 
   const raw = await callAI(system, productList);
   return safeParseJSON(raw, { picks: [], summary: "Here are some options for you.", followUpQuestion: null });
@@ -238,16 +299,37 @@ app.post('/chat', async (req, res) => {
   console.log(`\n[${sessionId}] User: "${message}"`);
 
   try {
-    // Step 1: Build person profile from message + history
-    const analysis = await buildPersonProfile(message, session.personProfile, session.history);
-    console.log(`[${sessionId}] Profile:`, JSON.stringify(analysis.personProfile));
-    console.log(`[${sessionId}] Search tags:`, analysis.searchTags, '| searchAll:', analysis.searchAll);
+    // ── Layer 1: Intent to Search Query ─────────────────────────
+    console.log('[Layer 1] Analyzing intent and building search params...');
+    const analysis = await analyzeIntent(message, session);
+    console.log('[Layer 1] Search params:', JSON.stringify(analysis.searchParams));
+    console.log('[Layer 1] Gift:', analysis.isGift, '| Mode:', analysis.mode, '| Clarify:', !!analysis.clarifyQuestion);
 
-    // Update stored person profile
-    session.personProfile = { ...session.personProfile, ...analysis.personProfile };
+    // Update person profile from Layer 1
+    if (analysis.personProfileUpdate && Object.keys(analysis.personProfileUpdate).length) {
+      session.personProfile = { ...session.personProfile, ...analysis.personProfileUpdate };
+    }
+    if (analysis.isGift) session.personProfile.isGift = true;
 
-    // Step 2: Ask clarifying question if critical info missing
-    if (analysis.clarifyQuestion && analysis.missingInfo) {
+    // Update recipient profile (Feature 3: Deep Gift Profile Building)
+    if (analysis.isGift && analysis.recipientProfileUpdate) {
+      const update = analysis.recipientProfileUpdate;
+      // Merge arrays, replace scalars
+      session.recipientProfile = {
+        ...session.recipientProfile,
+        ...update,
+        interests: [
+          ...new Set([...(session.recipientProfile.interests || []), ...(update.interests || [])])
+        ],
+        constraints: [
+          ...new Set([...(session.recipientProfile.constraints || []), ...(update.constraints || [])])
+        ]
+      };
+      console.log('[Layer 1] Recipient profile:', JSON.stringify(session.recipientProfile));
+    }
+
+    // Feature 2: Smart single clarifying question (pre-search check)
+    if (analysis.clarifyQuestion) {
       session.history.push({ role: 'user', content: message });
       session.history.push({ role: 'assistant', content: analysis.clarifyQuestion });
       return res.json({
@@ -257,59 +339,118 @@ app.post('/chat', async (req, res) => {
       });
     }
 
-    // Step 3: Fetch products — always fall back to full catalog if tag search is empty
+    // ── Layer 2 + 3: Fetch & Evaluate with re-search loop ────────
     let products = [];
     let usedFallback = false;
+    let evaluation = null;
+    let currentSearchParams = { ...analysis.searchParams };
+    let isRefining = false;
+    const MAX_ATTEMPTS = 3; // initial fetch + up to 2 re-searches
 
-    if (analysis.searchAll || analysis.searchTags.length === 0) {
-      products = await fetchAllProducts();
-    } else {
-      const tagFetches = await Promise.all(
-        analysis.searchTags.map(tag => fetchProductsByTag(tag, 20))
-      );
-      const seen = new Set();
-      for (const batch of tagFetches) {
-        for (const p of batch) {
-          if (!seen.has(p.id)) { seen.add(p.id); products.push(p); }
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      // ── Layer 2: Shopify Fetch ───────────────────────────────
+      console.log(`[Layer 2] Attempt ${attempt}: tags=[${currentSearchParams.tags}] searchAll=${currentSearchParams.searchAll}`);
+
+      let fetched = [];
+      if (currentSearchParams.searchAll || !currentSearchParams.tags?.length) {
+        fetched = await fetchAllProducts();
+      } else {
+        const tagFetches = await Promise.all(currentSearchParams.tags.map(tag => fetchProductsByTag(tag)));
+        const seen = new Set();
+        for (const batch of tagFetches) {
+          for (const p of batch) {
+            if (!seen.has(p.id)) { seen.add(p.id); fetched.push(p); }
+          }
+        }
+        if (fetched.length === 0) {
+          console.log(`[Layer 2] No tag results — falling back to full catalog`);
+          fetched = await fetchAllProducts();
+          usedFallback = true;
         }
       }
-      // If the requested category has no products in our store, fall back to full catalog
-      // so the AI can pick the closest alternative rather than saying "no results"
-      if (products.length === 0) {
-        console.log(`[${sessionId}] No products for tags [${analysis.searchTags}] — falling back to full catalog`);
-        products = await fetchAllProducts();
-        usedFallback = true;
+
+      // Budget filter — use recipient budget for gifts, else user budget
+      const budget = analysis.isGift
+        ? (session.recipientProfile.budget || currentSearchParams.budget)
+        : currentSearchParams.budget;
+
+      if (budget) {
+        const withinBudget = fetched.filter(p => parseFloat(p.variants[0]?.price) <= budget);
+        console.log(`[Layer 2] Budget filter ≤₹${budget}: ${fetched.length} → ${withinBudget.length}`);
+        if (withinBudget.length > 0) {
+          fetched = withinBudget;
+        } else if (attempt === MAX_ATTEMPTS) {
+          const minPrice = Math.min(...fetched.map(p => parseFloat(p.variants[0]?.price) || 99999));
+          const noResultMsg = `I don't have anything under ₹${budget.toLocaleString('en-IN')} right now. The most affordable options start at ₹${minPrice.toLocaleString('en-IN')}. Want me to show you the best picks around that price?`;
+          session.history.push({ role: 'user', content: message });
+          session.history.push({ role: 'assistant', content: noResultMsg });
+          return res.json({ type: 'no_results', message: noResultMsg });
+        }
+        // else: keep going with full set, next re-search may find something
       }
-    }
 
-    console.log(`[${sessionId}] Products fetched: ${products.length}${usedFallback ? ' (full catalog fallback)' : ''}`);
+      products = fetched;
+      console.log(`[Layer 2] Products available: ${products.length}`);
 
-    // Step 4: Budget filter — only apply if it meaningfully reduces the set
-    const budget = analysis.personProfile.budget;
-    if (budget) {
-      const withinBudget = products.filter(p => parseFloat(p.variants[0]?.price) <= budget);
-      console.log(`[${sessionId}] After budget filter (≤₹${budget}): ${withinBudget.length}`);
-      if (withinBudget.length > 0) {
-        products = withinBudget;
+      // ── Layer 3: Quality Evaluation ─────────────────────────
+      console.log(`[Layer 3] Evaluating ${Math.min(products.length, 30)} products...`);
+      evaluation = await evaluateProducts(products, currentSearchParams, session);
+
+      const sortedScores = [...(evaluation.scores || [])].sort((a, b) => b.score - a.score);
+      const top3Scores = sortedScores.slice(0, 3).map(s => s.score);
+      console.log('[Layer 3] Scores:', JSON.stringify(sortedScores.slice(0, 5)));
+
+      const allTop3Below60 = top3Scores.length >= 3 && top3Scores.every(s => s < 60);
+
+      if (!allTop3Below60 || attempt === MAX_ATTEMPTS) {
+        if (allTop3Below60 && attempt === MAX_ATTEMPTS) {
+          console.log(`[Layer 3] Attempts exhausted — using best available (scores: ${top3Scores.join(', ')})`);
+        } else {
+          console.log(`[Layer 3] Quality OK — top scores: ${top3Scores.join(', ')}`);
+        }
+        break;
+      }
+
+      // Trigger re-search with alternative tags
+      console.log(`[Layer 3] Top 3 all below 60 (${top3Scores.join(', ')}) — re-searching (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
+      isRefining = true;
+      session.searchAttempts += 1;
+
+      const altTags = (evaluation.alternativeTags || []).filter(t => !currentSearchParams.tags?.includes(t));
+      if (altTags.length > 0) {
+        currentSearchParams = { ...currentSearchParams, tags: altTags, searchAll: false };
       } else {
-        // Budget is too low for anything — tell user clearly with accurate min price
-        const minPrice = Math.min(...products.map(p => parseFloat(p.variants[0]?.price) || 99999));
-        const noResultMsg = `I don't have anything under ₹${budget.toLocaleString('en-IN')} right now. The most affordable options start at ₹${minPrice.toLocaleString('en-IN')}. Want me to show you the best picks around that price?`;
-        session.history.push({ role: 'user', content: message });
-        session.history.push({ role: 'assistant', content: noResultMsg });
-        return res.json({ type: 'no_results', message: noResultMsg });
+        currentSearchParams = { ...currentSearchParams, tags: [], searchAll: true };
       }
     }
 
-    // Step 5: AI ranks products against person profile
-    const ranking = await rankProducts(products, session.personProfile, message, usedFallback);
-    console.log(`[${sessionId}] Picks: ${ranking.picks.map(p => p.productIndex).join(', ')}`);
+    // ── Layer 4: Final Recommendation ───────────────────────────
+    console.log('[Layer 4] Generating final picks with reasoning...');
 
-    // Step 6: Build response with full product details
+    // Pre-sort products by evaluation score so ranker sees best candidates first
+    const scoredIndexed = (evaluation?.scores || [])
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 25)
+      .map(s => products[s.productIndex - 1])
+      .filter(Boolean);
+
+    const productPool = scoredIndexed.length > 0 ? scoredIndexed : products;
+
+    // For gift mode, use recipient profile as the "person" for ranking
+    const rankingProfile = session.personProfile.isGift
+      ? { ...session.personProfile, ...session.recipientProfile }
+      : session.personProfile;
+
+    const ranking = await rankProducts(productPool, rankingProfile, message, usedFallback);
+    console.log(`[Layer 4] Final picks: ${ranking.picks.map(p => `#${p.productIndex}(${p.matchScore}%)`).join(', ')}`);
+
     const pickedProducts = ranking.picks
       .map(pick => {
-        const product = products[pick.productIndex - 1];
-        if (!product) { console.warn(`Bad productIndex ${pick.productIndex}, products length ${products.length}`); return null; }
+        const product = productPool[pick.productIndex - 1];
+        if (!product) {
+          console.warn(`Bad productIndex ${pick.productIndex}, pool length ${productPool.length}`);
+          return null;
+        }
         return {
           ...pick,
           product: {
@@ -338,7 +479,8 @@ app.post('/chat', async (req, res) => {
       mode: analysis.mode,
       summary: ranking.summary,
       followUpQuestion: ranking.followUpQuestion,
-      picks: pickedProducts
+      picks: pickedProducts,
+      isRefining
     });
 
   } catch (err) {
@@ -349,19 +491,15 @@ app.post('/chat', async (req, res) => {
 });
 
 // ── Cart Route ───────────────────────────────────────────────────
-// POST /cart  body: { variantIds: [id, id, ...] }
-// Returns:    { checkoutUrl }
-//
-// Strategy: try Storefront API cartCreate first (gives a proper checkout session).
-// If that fails (common on dev stores with channel-publishing issues), fall back
-// to Shopify's universal cart URL which works without any channel setup.
+// POST /cart  body: { variantIds: ["gid://shopify/ProductVariant/123", ...] or [123, ...] }
+// Returns: { checkoutUrl, cartId? }
 app.post('/cart', async (req, res) => {
   const { variantIds } = req.body;
   if (!variantIds || !Array.isArray(variantIds) || variantIds.length === 0) {
     return res.status(400).json({ error: 'variantIds array required' });
   }
 
-  // ── Attempt 1: Storefront API cartCreate ──────────────────────
+  // ── Attempt: Storefront API cartCreate ───────────────────────
   try {
     const lines = variantIds.map(id => ({
       merchandiseId: String(id).startsWith('gid://')
@@ -397,14 +535,16 @@ app.post('/cart', async (req, res) => {
     }
     console.warn('Storefront API cart failed:', JSON.stringify(result));
   } catch (err) {
-    console.warn('Storefront API cart error, falling back:', err.message);
+    console.warn('Storefront API error, falling back:', err.message);
   }
 
-  // ── Fallback: Shopify universal cart URL ──────────────────────
-  // Format: https://shop.myshopify.com/cart/VARIANT_ID:qty,VARIANT_ID:qty
-  // Works on all Shopify stores without any channel publishing setup.
-  const cartItems = variantIds.map(id => `${id}:1`).join(',');
-  const checkoutUrl = `https://${SHOP}/cart/${cartItems}`;
+  // ── Fallback: Shopify universal cart URL ─────────────────────
+  // Extract numeric IDs from gid:// format if needed
+  const numericIds = variantIds.map(id => {
+    const str = String(id);
+    return str.startsWith('gid://') ? str.split('/').pop() : str;
+  });
+  const checkoutUrl = `https://${SHOP}/cart/${numericIds.map(id => `${id}:1`).join(',')}`;
   console.log('Cart fallback URL:', checkoutUrl);
   return res.json({ checkoutUrl, fallback: true });
 });
