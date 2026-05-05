@@ -549,12 +549,16 @@ app.post('/cart', async (req, res) => {
     // fall through to URL fallback
   }
 
-  // Fallback: universal Shopify cart URL — always works
-  const numericIds = variantIds.map(id => {
-    const str = String(id);
-    return str.startsWith('gid://') ? str.split('/').pop() : str;
-  });
-  const checkoutUrl = `https://${SHOP}/cart/${numericIds.map(id => `${id}:1`).join(',')}?storefront=true`;
+  // Fallback: universal Shopify cart URL — works for single and multiple items
+  const cartPath = variantIds
+    .map(id => {
+      const numericId = String(id).includes('gid://')
+        ? String(id).split('/').pop()
+        : String(id);
+      return `${numericId}:1`;
+    })
+    .join(',');
+  const checkoutUrl = `https://${SHOP}/cart/${cartPath}`;
   return res.json({ checkoutUrl, fallback: true });
 });
 
